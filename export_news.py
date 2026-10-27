@@ -17,6 +17,9 @@ from urllib import request, error, parse
 GUILD_ID = "990645542260445254"
 CHANNELS = {"news": "997782407673544754", "changelog": "997783396468142091"}
 MAX_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_IMAGE_PIXELS = 24_000_000
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif"}
 
 
 class ExportError(Exception):
@@ -41,7 +44,7 @@ def read_channel(token, channel, count, opener=None, sleep=time.sleep):
     opener = opener or request.build_opener(NoRedirect())
     url = f"https://discord.com/api/v10/channels/{channel}/messages?limit={count}"
     req = request.Request(url, headers={"Authorization": "Bot " + token,
-        "User-Agent": "OldschoolLifeNews/1.0", "Accept": "application/json"}, method="GET")
+        "User-Agent": "DiscordBot (https://github.com/TheUsforcer/oldschoollife-news, 1.4.0)", "Accept": "application/json"}, method="GET")
     for attempt in range(3):
         try:
             with opener.open(req, timeout=25) as response:
@@ -89,6 +92,53 @@ def clean_mentions(text, message):
     return re.sub(r"<a?:([A-Za-z0-9_]+):\d+>", r":\1:", text).replace("\x00", "")
 
 
+def post_images(message, kind):
+    """Only uploaded raster images from the two public announcement channels.
+
+    Keep Discord's signed query unchanged. Each snapshot renews these URLs;
+    clients cache the immutable attachment by its path, not by the signature.
+    """
+    result, seen = [], set()
+    sources = list(message.get("attachments") or [])
+    for embed in message.get("embeds") or []:
+        if isinstance(embed, dict):
+            sources.extend(embed.get(key) for key in ("image", "thumbnail") if isinstance(embed.get(key), dict))
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        url = source.get("url")
+        if not isinstance(url, str) or len(url) > 4096:
+            continue
+        try:
+            uri = parse.urlsplit(url)
+            parts = uri.path.split("/")
+            if (uri.scheme != "https" or uri.hostname not in ("cdn.discordapp.com", "media.discordapp.net")
+                    or uri.username or uri.password or uri.fragment or uri.port not in (None, 443)
+                    or len(parts) != 5 or parts[1] != "attachments" or parts[2] != CHANNELS[kind]
+                    or not re.fullmatch(r"[0-9]{1,25}", parts[3])):
+                continue
+        except ValueError:
+            continue
+        filename = str(source.get("filename") or parse.unquote(parts[4]))
+        media_type = IMAGE_TYPES.get(Path(filename).suffix.lower())
+        size = source.get("size", 0)
+        width, height = source.get("width") or 0, source.get("height") or 0
+        if (not media_type or source.get("content_type", media_type) != media_type
+                or type(size) is not int or not 0 <= size <= MAX_IMAGE_BYTES
+                or type(width) is not int or type(height) is not int
+                or not 0 <= width <= 12000 or not 0 <= height <= 12000 or width * height > MAX_IMAGE_PIXELS
+                or filename.startswith("SPOILER_") or source.get("is_spoiler") or int(source.get("flags") or 0) & 8):
+            continue
+        key = uri.hostname + uri.path
+        if key not in seen:
+            seen.add(key)
+            result.append({"url": url, "filename": filename[:160], "contentType": media_type,
+                           "size": size, "width": width, "height": height})
+        if len(result) == 10:
+            break
+    return result
+
+
 def post_from_message(message, kind):
     if not isinstance(message, dict) or message.get("type", 0) not in (0, 19):
         return None
@@ -115,6 +165,9 @@ def post_from_message(message, kind):
     if attachments:
         chunks.append("Anhänge im Discord-Beitrag: " + ", ".join(attachments))
     text = clean_mentions("\n\n".join(part.strip() for part in chunks if part.strip()), message).strip()[:8000]
+    images = post_images(message, kind)
+    if not text and images:
+        text = "Bilder: " + ", ".join(image["filename"] for image in images)
     if not text:
         return None
     title = next((line.strip().lstrip("# ").replace("**", "").replace("__", "") for line in text.splitlines() if line.strip()), "Beitrag")[:160]
@@ -124,7 +177,7 @@ def post_from_message(message, kind):
     return {"id": post_id, "kind": kind, "channelId": CHANNELS[kind], "title": title or "Beitrag",
             "text": text, "publishedAt": published.astimezone(timezone.utc).isoformat(),
             "author": str(author.get("global_name") or author.get("username") or "Serverteam")[:120],
-            "url": f"https://discord.com/channels/{GUILD_ID}/{CHANNELS[kind]}/{post_id}"}
+            "url": f"https://discord.com/channels/{GUILD_ID}/{CHANNELS[kind]}/{post_id}", "images": images}
 
 
 def build_feed(messages_by_kind, now=None):
